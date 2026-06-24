@@ -1,0 +1,250 @@
+﻿LO5
+
+1. podman run -d --name web -p 80:8080 docker.io/library/nginx (nginx listens on 80; the site is not reachable on the host port you expected - what is reversed?)
+A
+The port order is hostPort:containerPort. The command maps host 80 to container 8080, but nginx listens on container 80. Fix:
+podman run -d --name web -p 8080:80 docker.io/library/nginx
+
+2. podman run -d --name db -e MYSQL_ROOT_PASSWORD docker.io/library/mysql (the container exits during init - inspect podman logs.)
+A
+MYSQL_ROOT_PASSWORD has no value. MySQL requires a password or another explicit init option. Fix:
+podman run -d --name db -e MYSQL_ROOT_PASSWORD=secret docker.io/library/mysql
+
+3. podman run -d --name app --network host -p 8080:80 docker.io/library/nginx (why is the -p flag effectively ignored here?)
+A
+With --network host, the container uses the host network directly, so port publishing is ignored. Fix by removing host networking:
+podman run -d --name app -p 8080:80 docker.io/library/nginx
+or keep host networking and use the port the process listens on.
+
+4. podman run -d --name c1 docker.io/library/busybox (the container goes straight to Exited (0) - why, and how do you keep it running?)
+A
+BusyBox has no long-running default process here, so it exits successfully. Fix:
+podman run -d --name c1 docker.io/library/busybox sleep 1d
+A container stays alive only while its main process runs.
+
+5. podman run --rm -d --name job docker.io/library/alpine echo hello (then podman logs job fails - explain the --rm + detached gotcha.)
+A
+The job exits quickly and --rm removes the container immediately, so logs cannot find it. Fix by omitting --rm when you need logs:
+podman run -d --name job docker.io/library/alpine echo hello
+podman logs job
+
+6. podman run -d -p 8080:80 --memory 8m docker.io/library/mysql (the database never becomes healthy - what limit is the problem?)
+A
+The memory limit is far too low. MySQL needs much more than 8 MB. Fix:
+podman run -d --name mysql -p 3306:3306 --memory 512m -e MYSQL_ROOT_PASSWORD=secret docker.io/library/mysql
+
+7. podman run -d --name a docker.io/library/alpine sleep 1d / podman run -d --name b docker.io/library/alpine sleep 1d / podman exec a ping b (name resolution fails - why, on the default network, and how do you fix it?)
+A
+Name-based DNS works on user-defined networks, not reliably on the default network. Fix:
+podman network create appnet
+podman run -d --name a --network appnet docker.io/library/alpine sleep 1d
+podman run -d --name b --network appnet docker.io/library/alpine sleep 1d
+podman exec a ping b
+
+8. podman run -d --name web -v ./html:/usr/share/nginx/html docker.io/library/nginx (the files are not visible in the container, or SELinux denies access - what mount flag is missing?)
+A
+Add an SELinux relabel flag:
+podman run -d --name web -v ./html:/usr/share/nginx/html:Z docker.io/library/nginx
+Use :z instead of :Z if multiple containers need to share the same content.
+
+9. For each Containerfile/Dockerfile: identify the mistake, fix it, and explain what was wrong.
+A
+This instruction applies to questions 10-18: identify the faulty Dockerfile/Containerfile line or design, show the corrected version, and explain the cause.
+
+10. FROM debian:12 / RUN apt-get install -y nginx (the build fails to find the package - what is missing before install?)
+A
+apt-get update is missing. Fix:
+FROM debian:12
+RUN apt-get update && apt-get install -y nginx && rm -rf /var/lib/apt/lists/*
+Package indexes must be updated before apt can install packages.
+
+11. FROM python:3.11 / COPY app.py /app/app.py / WORKDIR /app / CMD python app.py (the app starts but does not handle signals / cannot be stopped cleanly - shell vs exec form?)
+A
+CMD uses shell form. Fix with exec form:
+CMD ["python", "app.py"]
+Exec form lets Python receive signals directly as PID 1.
+
+12. FROM node:20 / COPY . /app / WORKDIR /app / RUN npm install (every source change triggers a full npm install - reorder for layer caching.)
+A
+Copy dependency metadata first:
+FROM node:20
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+Now source-only changes do not invalidate the npm install layer.
+
+13. FROM alpine:3.20 / ENV PATH=/app/bin / RUN apk add --no-cache curl (after this, curl/sh are not found - what did setting PATH break?)
+A
+PATH was overwritten and removed system paths. Fix:
+ENV PATH="/app/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+The original PATH hid commands like sh and curl.
+
+14. FROM ubuntu:24.04 / EXPOSE 8080 / CMD ["python3", "-m", "http.server", "3000"]
+A
+The app listens on 3000 but EXPOSE says 8080. Fix:
+EXPOSE 3000
+CMD ["python3", "-m", "http.server", "3000"]
+EXPOSE is metadata only; it does not change the app port.
+
+15. You map -p 8080:8080 but nothing answers - what mismatch is there, and what does EXPOSE actually do?
+A
+The container is listening on 3000, not 8080. Fix the mapping:
+podman run -p 8080:3000 IMAGE
+EXPOSE documents intended ports but does not publish ports or make the app listen there.
+
+16. FROM debian:12 / RUN apt-get update && apt-get install -y build-essential (the image is huge - how do you cut the size in the same layer?)
+A
+Clean package lists in the same layer:
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+Cleanup must be in the same RUN layer or earlier layer size remains.
+
+17. FROM python:3.11 / USER appuser / COPY requirements.txt /app/requirements.txt / RUN pip install -r /app/requirements.txt (permission denied errors - what is wrong with the USER/COPY ordering and ownership?)
+A
+The build switches to appuser before preparing ownership/permissions. Fix by creating/chowning the app directory and copying with ownership before USER, or install dependencies before switching:
+RUN useradd -m appuser && mkdir /app && chown appuser:appuser /app
+COPY --chown=appuser:appuser requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt
+USER appuser
+
+18. FROM golang:1.22 / COPY . /src / WORKDIR /src / RUN go build -o app . / CMD ["/src/app"] (the final image is about 1 GB - how would a multi-stage build fix it?)
+A
+Build in a Go image and copy only the binary into a tiny runtime image:
+FROM golang:1.22 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -o /app .
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /app /app
+CMD ["/app"]
+
+19. A pod is stuck Pending. Walk through the diagnosis with kubectl describe pod and identify the reason from the events (scheduling / resources / PVC / nodeSelector).
+A
+Run kubectl describe pod POD and read Events. Common causes: insufficient CPU/memory, unbound PVC, nodeSelector/affinity mismatch, taints without tolerations, or no ready nodes. Fix the exact event cause.
+
+20. Find a deployment from older tasks, remove a couple of spaces and try to deploy it. Identify the cause in the error messages and fix it.
+A
+YAML is indentation-sensitive. kubectl may report mapping values are not allowed, unknown field, or did not find expected key. Restore correct indentation and validate with:
+kubectl apply --dry-run=server -f deployment.yaml
+
+21. A pod is in ImagePullBackOff. Diagnose the cause (image typo, missing tag, private registry without pull secret) and fix it.
+A
+Use kubectl describe pod POD and check Events. Fix the image name/tag, push the missing image, or create/reference imagePullSecrets for a private registry.
+
+22. A pod is in CrashLoopBackOff. Use kubectl logs --previous to read the last crash and fix the root cause.
+A
+kubectl logs POD --previous
+kubectl describe pod POD
+Fix the root cause shown in logs: bad command, missing config, failed dependency, permission error, or application crash.
+
+23. A pod's last state shows OOMKilled. Confirm it from kubectl get pod -o yaml / describe, then fix it (raise the memory limit or fix the app).
+A
+Confirm with kubectl describe pod POD or kubectl get pod POD -o yaml. Look for lastState.terminated.reason: OOMKilled or exit code 137. Fix by increasing memory limits/requests or reducing app memory use.
+
+24. A Deployment's pods never become Ready. Trace it to a failing readiness probe and correct the probe or the app.
+A
+Run kubectl describe pod POD and check probe failures in Events. Fix the readiness path, port, scheme, timing, or the app health endpoint so it returns success only when ready.
+
+25. A Service returns nothing. Diagnose a Service/pod label mismatch using kubectl get endpoints.
+A
+kubectl get endpoints SERVICE
+kubectl get svc SERVICE -o yaml
+kubectl get pods --show-labels
+If endpoints are empty, the Service selector does not match ready pod labels. Fix the selector or labels.
+
+26. Given a manifest where spec.selector.matchLabels does not match spec.template.metadata.labels, explain the error kubectl apply returns and fix it.
+A
+kubectl rejects the Deployment because the selector must match template labels. Fix by making spec.selector.matchLabels and spec.template.metadata.labels use the same key/value labels.
+
+27. Given a manifest whose resources.requests exceed any node's capacity, explain why the pod is Pending (Insufficient cpu/memory) and fix it.
+A
+The scheduler cannot place a pod whose requested CPU or memory is larger than available node capacity. Events show Insufficient cpu/memory. Fix by lowering requests, adding capacity, or using a larger node.
+
+28. Given a pod mounting a PVC that does not exist, diagnose the FailedMount/Pending and create the PVC.
+A
+kubectl describe pod POD shows the missing claim. Create a PVC with the exact claimName referenced by the pod, or correct the pod manifest to reference an existing PVC.
+
+29. A container based on ubuntu with no long-running command shows Completed/CrashLoopBackOff. Explain why and add a proper command.
+A
+Ubuntu has no default long-running service. If the command exits, the container stops. Add a real foreground app command, or for testing:
+command: ["sleep", "infinity"]
+
+30. Use kubectl get events --sort-by=.lastTimestamp (or kubectl events) to triage everything that happened to a pod over time.
+A
+kubectl get events --sort-by=.lastTimestamp
+or kubectl events. Read the timeline for scheduling, image pulls, mounts, starts, probe failures, restarts, and the first real error.
+
+31. Use kubectl exec -it to get a shell in a pod and debug DNS with nslookup and cat /etc/resolv.conf.
+A
+kubectl exec -it POD -- sh
+cat /etc/resolv.conf
+nslookup kubernetes.default.svc.cluster.local
+nslookup SERVICE.NAMESPACE.svc.cluster.local
+This checks DNS servers, search domains, and service name resolution.
+
+32. Use an ephemeral debug container (kubectl debug -it <pod> --image=busybox --target=<container>) to troubleshoot a no-shell/distroless container.
+A
+kubectl debug -it POD --image=busybox --target=CONTAINER -- sh
+This adds a temporary troubleshooting container to the pod, useful when the main container has no shell or tools.
+
+33. Spin up a throwaway kubectl run tmp --rm -it --image=busybox pod to test connectivity to a Service from inside the cluster.
+A
+kubectl run tmp --rm -it --image=busybox -- sh
+Inside run nslookup SERVICE, wget -O- http://SERVICE:PORT, or nc -zv SERVICE PORT. This tests from the cluster network.
+
+34. A node shows NotReady. List what you would check (kubelet, disk pressure, CNI) and inspect it on minikube with kubectl describe node and sudo minikube logs.
+A
+Check kubectl describe node NODE for Ready condition, DiskPressure, MemoryPressure, PIDPressure, NetworkUnavailable, and events. On minikube, check minikube logs and kubelet logs. Also inspect disk space and CNI/network plugin health.
+
+35. A pod is stuck Terminating. Explain finalizers and the grace period, then force-delete it (--grace-period=0 --force) and state the risks.
+A
+Terminating can wait for graceful shutdown, finalizers, volume detach, or node response. Force delete:
+kubectl delete pod POD --grace-period=0 --force
+Risk: cleanup hooks may not finish, the process may still run on an unreachable node, and storage/network cleanup may be inconsistent.
+
+36. Given a manifest with the wrong apiVersion/kind pairing (e.g. apps/v1 + Pod), explain the validation error and correct the group/version.
+A
+Pod uses apiVersion v1, not apps/v1. apps/v1 is for Deployment, StatefulSet, and DaemonSet. Fix:
+apiVersion: v1
+kind: Pod
+kubectl reports no match or invalid kind for the apiVersion/kind pair.
+
+37. A pod fails with CreateContainerConfigError because a configMapKeyRef key is missing. Diagnose and fix.
+A
+kubectl describe pod POD shows the missing key. Add the key to the ConfigMap, correct the key name in the pod spec, or mark it optional if acceptable.
+
+38. A pod cannot mount a Secret that lives in a different namespace. Explain namespace scoping and fix it.
+A
+Secrets are namespace-scoped. A pod can only mount Secrets from its own namespace. Fix by creating/copying the Secret into the pod namespace or moving the pod to the Secret's namespace.
+
+39. A rollout is stuck with ProgressDeadlineExceeded. Use kubectl describe deployment / rollout status to find the cause and remediate.
+A
+kubectl rollout status deployment/APP
+kubectl describe deployment APP
+Then inspect the failing pods. Common causes: ImagePullBackOff, CrashLoopBackOff, readiness probe failures, or insufficient resources. Fix the pod issue and retry the rollout.
+
+40. Catch indentation/field typos (e.g. imagePullpolicy, misnested ports) before applying with kubectl apply --dry-run=server / --validate=true, then fix them.
+A
+kubectl apply --dry-run=server --validate=true -f manifest.yaml
+This catches invalid fields, wrong capitalization such as imagePullPolicy, and misnested YAML before changing the cluster.
+
+41. An app's logs say it cannot reach its database Service. Verify in order: pod running -> Service exists -> endpoints populated -> DNS resolves -> correct port, and identify the broken link.
+A
+Check:
+kubectl get pod APP_POD
+kubectl get svc DB_SERVICE
+kubectl get endpoints DB_SERVICE
+kubectl exec APP_POD -- nslookup DB_SERVICE
+kubectl exec APP_POD -- nc -zv DB_SERVICE PORT
+The first failed step shows the broken link.
+
+42. Read a container's state/lastState and restartCount with kubectl get pod -o jsonpath to determine the root cause of repeated restarts.
+A
+kubectl get pod POD -o jsonpath='{.status.containerStatuses[*].restartCount}'
+kubectl get pod POD -o jsonpath='{.status.containerStatuses[*].state}'
+kubectl get pod POD -o jsonpath='{.status.containerStatuses[*].lastState}'
+These fields show current state, previous termination reason, and how often it restarted.
+
+43. Compare OpenShift Route to Ingress.
+A
+Both expose HTTP/HTTPS apps outside the cluster. Ingress is the standard Kubernetes API and needs an Ingress controller. OpenShift Route is OpenShift's built-in routing object integrated with the OpenShift router and TLS features. Route is simpler on OpenShift; Ingress is more portable across Kubernetes distributions.

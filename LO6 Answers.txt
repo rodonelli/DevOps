@@ -1,0 +1,93 @@
+﻿LO6
+
+1. Analyze the networking model of Kubernetes versus Docker's network.
+A
+Docker commonly uses bridge networks where containers get private IPs and host ports are published with -p. Kubernetes gives every pod a cluster-routable IP, containers inside a pod share localhost, and Services provide stable discovery/load balancing for changing pods. Kubernetes networking is better for distributed systems because it is built around cross-node communication, service discovery, and policy.
+
+2. Evaluate Kubernetes storage abstraction (CSI, StorageClasses, dynamic provisioning) against Podman's storage plugins. Which is more flexible for stateful workloads, and why?
+A
+Kubernetes is more flexible for stateful workloads. CSI, StorageClasses, PVs, and PVCs let applications request storage without knowing the backend, and storage can be dynamically provisioned from cloud disks, SAN/NAS, or other CSI providers. Podman volumes work well on one host, but they do not provide the same cluster scheduling, dynamic provisioning, or standardized attach/detach behavior.
+
+3. Evaluate the operator pattern (CRDs + controllers) for managing stateful services versus using only k8s manifests, in terms of control and effort.
+A
+Operators encode operational knowledge into controllers. For databases, they can automate backups, upgrades, failover, scaling, and recovery. Plain manifests are simpler and give direct control, but humans must handle day-2 operations. Operators require more trust and learning, but reduce effort for complex stateful services.
+
+4. Assess the developer experience of plain Kubernetes (kubectl + manifests) versus OpenShift's Source-to-Image (S2I) and developer console. What does each optimize for?
+A
+Plain Kubernetes optimizes for portability, explicit control, and standard APIs. Developers must understand images, YAML, Services, Deployments, probes, and kubectl. OpenShift S2I and the developer console optimize for guided workflows and faster onboarding, turning source code into running apps with less manual image-building and YAML writing.
+
+5. Critically evaluate migrating a workload from OpenShift to Kubernetes.
+A
+Standard resources such as Deployments, Services, ConfigMaps, and Secrets migrate fairly well. OpenShift-specific features such as Routes, BuildConfigs, ImageStreams, SCCs, templates, and S2I need replacements. Migration can improve portability, but it may lose integrated security, build, registry, and developer tooling.
+
+6. Evaluate running CI/CD build agents (Jenkins agents, GitLab runners, Tekton) inside Kubernetes versus on dedicated VMs, considering isolation, autoscaling, and noisy-neighbor effects.
+A
+Kubernetes agents are elastic, per-job, easy to clean up, and can scale with demand. They fit tools like Tekton and dynamic GitLab/Jenkins runners. The risk is noisy-neighbor impact from heavy builds on shared nodes. Dedicated VMs are simpler and isolate heavy workloads better, but they are less elastic and can waste capacity.
+
+7. How does Kubernetes integrate with cloud environments and dynamic capacity provisioning?
+A
+Kubernetes integrates with cloud APIs for load balancers, storage, identity, networking, and autoscaling. A LoadBalancer Service can create a cloud load balancer, a PVC can create a disk through CSI, and cluster autoscaler can add nodes when pods cannot be scheduled. This lets infrastructure follow application demand.
+
+8. Critically evaluate the default security and hardening of OpenShift versus vanilla Kubernetes. Why do enterprises in regulated industries often choose OpenShift?
+A
+OpenShift has stronger default security opinions: restricted security contexts, integrated authentication, RBAC, registry controls, monitoring, logging integrations, and supported upgrades. Vanilla Kubernetes can be hardened, but it requires assembling more pieces manually. Regulated enterprises often choose OpenShift for vendor support, auditability, and safer defaults.
+
+9. Critically evaluate the learning curve and required skill set of OpenShift versus plain Kubernetes. Does OpenShift's added abstraction help or hinder a team new to containers?
+A
+OpenShift helps beginners with a console, S2I, routes, templates, and integrated workflows. It can also hinder because teams must learn Kubernetes plus OpenShift-specific concepts. It helps most when the team wants a guided enterprise platform; it hinders if the goal is to learn portable Kubernetes with minimal abstraction.
+
+10. Compare the resource footprint of full Kubernetes versus k3s for a small on-premise deployment. When is full Kubernetes overkill?
+A
+Full Kubernetes has more components and usually needs more CPU, memory, and operational care. k3s is lighter and designed for small clusters, labs, edge, and constrained environments. Full Kubernetes is overkill when workloads are small, HA needs are modest, and the team does not need advanced enterprise integrations.
+
+11. Defend whether a small team should use Docker Compose on a single host or move straight to Kubernetes, considering complexity, scaling needs, and resilience.
+A
+A small team should usually start with Docker Compose if one host is enough. It is cheaper, simpler, and faster to operate. Kubernetes is justified when they need multi-node resilience, autoscaling, rolling updates, stronger service discovery, or platform standardization. Moving too early can add more operational burden than value.
+
+12. Analyze vendor lock-in across Kubernetes (open source / CNCF) and OpenShift (Red Hat). How does the choice affect long-term flexibility?
+A
+Kubernetes has lower lock-in because it is an open CNCF standard with many providers. Managed Kubernetes still has provider-specific integrations. OpenShift is Kubernetes-based but adds Red Hat-specific APIs and workflows. It reduces operational risk through support but increases platform lock-in. Portability is highest when workloads use standard Kubernetes APIs.
+
+13. Defend a recommendation of OpenShift over vanilla Kubernetes for a company that wants an integrated, vendor-supported platform with built-in developer and operations tooling.
+A
+OpenShift is a strong recommendation because it packages Kubernetes with registry, routes, builds/S2I, developer console, monitoring, authentication integration, policy, and Red Hat support. Vanilla Kubernetes requires choosing and maintaining many separate tools. If the company values support and consistency, OpenShift fits well.
+
+14. Compare storage provisioning between Kubernetes and regular VM workloads.
+A
+With VMs, storage is often manually attached, formatted, mounted, and tracked per server. Kubernetes uses PVCs and StorageClasses so applications request storage declaratively and the platform can provision it dynamically. Kubernetes is more automated, but requires understanding reclaim policies, access modes, CSI drivers, and scheduling constraints.
+
+15. A startup with two engineers must ship a containerized product quickly and cheaply. Recommend container solution and justify your choice on cost and operational overhead.
+A
+Use Docker Compose or Podman Compose on a single VM, ideally with managed database services. It is cheap, fast, and understandable for two engineers. Kubernetes should wait until they need multi-node scaling, self-healing, or a platform team, because cluster operations would consume too much time early on.
+
+16. Compare Docker and Podman in terms of architecture (daemon vs daemonless) and rootless security. Why might a security-conscious team prefer Podman?
+A
+Docker traditionally uses a central daemon. Podman is daemonless and has strong rootless support, so users can run containers without broad access to a privileged daemon. A security-conscious team may prefer Podman because it reduces the impact of compromised container tooling or user accounts.
+
+17. Compare the day-2 operational overhead (cluster upgrades, scaling nodes, backups) of self-managed Kubernetes versus a managed Kubernetes service.
+A
+Self-managed Kubernetes gives more control but requires upgrades, etcd backups, node lifecycle, security patching, CNI troubleshooting, monitoring, and disaster recovery. Managed Kubernetes offloads much of the control-plane work and simplifies scaling/upgrades, at the cost of provider dependency and less direct control.
+
+18. A media-streaming company expects spiky, unpredictable global traffic. Recommend a containerized solution. Elaborate your choice.
+A
+Use managed Kubernetes across cloud regions with autoscaling, cloud load balancers, and a CDN. Kubernetes handles rolling updates, self-healing, service discovery, and horizontal scaling. The CDN absorbs global traffic near users. A single Compose/Podman host would not provide enough resilience or scaling for unpredictable global traffic.
+
+19. Defend whether a company that has outgrown Docker Swarm (or a single Compose host) should migrate to Kubernetes - weigh the migration effort against the long-term benefits.
+A
+If the company needs multi-node scheduling, self-healing, autoscaling, advanced deployments, and a larger ecosystem, Kubernetes is worth the migration. The effort includes rewriting deployment definitions, learning cluster operations, redesigning networking/storage, and adding observability. The long-term benefit is a standard orchestration platform that can scale with the company.
+
+20. Would you choose Kubernetes as a solution for a microservices architecture, focus on its orchestration, resilience and ecosystem. Elaborate your standing with arguments.
+A
+Yes, for serious microservices I would choose Kubernetes. It provides service discovery, rolling updates, self-healing, scaling, config/secret management, probes, and a large ecosystem. It is especially useful when services deploy independently. The trade-off is complexity, so a managed service or platform team is important.
+
+21. Would you choose Kubernetes for enterprise-grade applications, focus on its scalability, community support and feature richness. Elaborate your standing with arguments.
+A
+Yes. Kubernetes is strong for enterprise applications because it scales well, has broad community support, and has mature features for deployment, networking, storage, observability, and security integration. Enterprises must still invest in governance, monitoring, policy, and operational skill.
+
+22. Would you choose OpenShift as a solution for a microservices architecture, focus on its orchestration, resilience and ecosystem. Elaborate your standing with arguments.
+A
+Yes, especially when the organization wants Kubernetes plus an integrated enterprise platform. OpenShift supports orchestration, routes, service discovery, health checks, scaling, and strong security defaults. It is heavier and more Red Hat-specific than plain Kubernetes, but it gives a cohesive platform.
+
+23. Would you choose OpenShift for enterprise-grade applications, focus on its scalability, community support and feature richness. Elaborate your standing with arguments.
+A
+Yes. OpenShift is well suited for enterprise-grade applications because it builds on Kubernetes and adds security defaults, developer tooling, operations tooling, Red Hat support, and consistent platform features. I would choose it when compliance, support, standardization, and built-in tooling matter more than having the lightest possible platform.

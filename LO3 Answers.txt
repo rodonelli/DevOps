@@ -1,0 +1,193 @@
+﻿LO3
+
+1. Create a pod with podman pod create (publishing a port), add an app container and a database container to it, and show they reach each other over localhost (shared network namespace).
+A
+Create the pod and publish the port on the pod:
+podman pod create --name lo3pod -p 8080:80
+podman run -d --pod lo3pod --name db -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --pod lo3pod --name app docker.io/library/nginx:latest
+Containers in the same pod share the network namespace, so app can reach db through localhost, for example with: podman exec app nc -zv localhost 5432.
+
+2. Create a user-defined network, run an app container and a postgres container on it, and prove the app resolves the database by container name (podman DNS on custom networks).
+A
+podman network create appnet
+podman run -d --name db --network appnet -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --name app --network appnet docker.io/library/alpine sleep 1d
+podman exec app getent hosts db
+podman exec app nc -zv db 5432
+On a custom network, Podman DNS resolves the container name db to the database container IP.
+
+3. Deploy a two-tier stack of your choice that is not Drupal/Joomla/WordPress (e.g. Ghost + MySQL, Gitea + PostgreSQL, or Redmine + PostgreSQL) and complete its first-run setup.
+A
+Example: Gitea + PostgreSQL.
+podman network create gitea-net
+podman volume create gitea-db
+podman volume create gitea-data
+podman run -d --name gitea-db --network gitea-net -v gitea-db:/var/lib/postgresql/data -e POSTGRES_DB=gitea -e POSTGRES_USER=gitea -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --name gitea --network gitea-net -p 3000:3000 -v gitea-data:/data -e GITEA__database__DB_TYPE=postgres -e GITEA__database__HOST=gitea-db:5432 -e GITEA__database__NAME=gitea -e GITEA__database__USER=gitea -e GITEA__database__PASSWD=secret docker.io/gitea/gitea:latest
+Open http://localhost:3000 and finish the first-run installer using the PostgreSQL settings.
+
+4. Persist the database's data in a named volume so it survives podman rm + re-creation of the DB container; prove the data is still there afterward.
+A
+podman volume create pgdata
+podman run -d --name pg -v pgdata:/var/lib/postgresql/data -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman exec pg psql -U postgres -c "CREATE TABLE test(id int); INSERT INTO test VALUES (1);"
+podman rm -f pg
+podman run -d --name pg -v pgdata:/var/lib/postgresql/data -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman exec pg psql -U postgres -c "SELECT * FROM test;"
+The row is still present because the volume, not the container filesystem, stored the database data.
+
+5. Use a podman secret (podman secret create + --secret) to pass the database password instead of --env; explain the security benefit.
+A
+printf "secretpass" | podman secret create db_password -
+podman run -d --name pg --secret db_password,type=env,target=POSTGRES_PASSWORD docker.io/library/postgres:16
+Secrets reduce exposure in shell history, compose files, and container inspection output compared with plain environment variables in the run command.
+
+6. Write a podman compose file (compose.yaml) for an app + database, bring it up with podman compose up -d, and show both services running.
+A
+compose.yaml:
+services:
+  db:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: appdb
+  app:
+    image: docker.io/library/adminer:latest
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+Run: podman compose up -d, then podman compose ps. Both services should be listed as running.
+
+7. In that compose file, keep the database on an internal network with no published port and expose only the app; prove the DB is not reachable from the host.
+A
+Put both services on a backend network, but publish only the app port. Do not add ports: to db.
+networks:
+  backend:
+    internal: true
+From the host, nc -zv localhost 5432 should fail because the database has no published host port. The app can still reach db by service name on the internal network.
+
+8. Add a compose healthcheck plus depends_on: condition: service_healthy so the app waits for the database; demonstrate the startup ordering.
+A
+Add to db:
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U postgres"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+Add to app:
+depends_on:
+  db:
+    condition: service_healthy
+After podman compose up -d, podman compose ps shows db becoming healthy before app starts.
+
+9. Use an env_file: in compose for the database credentials instead of inline values.
+A
+Create db.env:
+POSTGRES_DB=appdb
+POSTGRES_USER=appuser
+POSTGRES_PASSWORD=secret
+Use it:
+services:
+  db:
+    image: docker.io/library/postgres:16
+    env_file:
+      - db.env
+This separates credentials/configuration from the main compose.yaml.
+
+10. Scale one compose service to multiple replicas (podman compose up --scale app=3) and explain how requests are distributed.
+A
+podman compose up -d --scale app=3
+podman compose ps
+Compose creates three app containers. Requests are distributed only if a load balancer or reverse proxy routes to those replicas; a single host port cannot normally be bound by all replicas at once.
+
+11. Mount a bind mount for app configuration and a named volume for data in the same container, and explain why you would use each.
+A
+podman volume create appdata
+podman run -d --name app -v ./config:/etc/app:ro -v appdata:/var/lib/appdata docker.io/library/alpine sleep 1d
+Use a bind mount for host-editable configuration and a named volume for persistent app data managed by Podman.
+
+12. Back up a named volume to a tarball using a helper alpine/busybox container that mounts the volume, then restore it into a fresh volume.
+A
+Backup:
+podman run --rm -v appdata:/data:ro -v "$PWD":/backup docker.io/library/alpine tar czf /backup/appdata.tar.gz -C /data .
+Restore:
+podman volume create appdata2
+podman run --rm -v appdata2:/data -v "$PWD":/backup docker.io/library/alpine sh -c "cd /data && tar xzf /backup/appdata.tar.gz"
+The helper container can access both the volume and the backup directory.
+
+13. Put an nginx reverse-proxy container in front of an app container on a shared network and route host traffic through nginx to the app.
+A
+podman network create webnet
+podman run -d --name app --network webnet docker.io/library/httpd:2.4
+Create nginx.conf with proxy_pass http://app:80; and run:
+podman run -d --name proxy --network webnet -p 8080:80 -v ./nginx.conf:/etc/nginx/conf.d/default.conf:ro docker.io/library/nginx:latest
+Traffic to localhost:8080 goes to nginx, then nginx forwards it to app by name.
+
+14. Add a database-admin container (e.g. adminer or pgadmin) to the network and use it to inspect the database.
+A
+podman network create dbnet
+podman run -d --name db --network dbnet -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --name adminer --network dbnet -p 8080:8080 docker.io/library/adminer:latest
+Open http://localhost:8080 and log in with server db, user postgres, and password secret.
+
+15. Generate Kubernetes YAML from a running pod with podman generate kube and explain how it bridges LO3 to LO4.
+A
+podman pod create --name webpod -p 8080:80
+podman run -d --pod webpod --name web docker.io/library/nginx:latest
+podman generate kube webpod > webpod.yaml
+This bridges LO3 to LO4 because a local Podman pod is converted into Kubernetes YAML that can be studied or reused with Kubernetes-style tooling.
+
+16. Run a pod from a Kubernetes YAML with podman kube play, then tear it down with podman kube play --down.
+A
+podman kube play webpod.yaml
+podman pod ps
+podman kube play --down webpod.yaml
+podman pod ps
+podman kube play starts resources from Kubernetes YAML locally; --down removes them.
+
+17. Set per-service CPU/memory limits in a compose file and verify them with podman stats.
+A
+In compose:
+deploy:
+  resources:
+    limits:
+      cpus: "0.50"
+      memory: 256M
+Run podman compose up -d and verify live usage with podman stats. podman inspect can also show configured limits.
+
+18. Inspect a pod with podman pod inspect and show which Linux namespaces the containers share (network, IPC) and which they do not (PID by default).
+A
+podman pod inspect lo3pod
+Containers in a pod share the network namespace, so they share IP/localhost. They commonly share IPC/UTS through the pod infrastructure container. PID is not shared by default, so processes are isolated unless PID sharing is enabled.
+
+19. Demonstrate name-based discovery failing when two containers are on different networks, then fix it by attaching them to a common network.
+A
+Create net1 and net2, run container a on net1 and b on net2, then podman exec a getent hosts b fails. Fix with:
+podman network connect net1 b
+podman exec a getent hosts b
+After b joins net1, a can resolve b by name.
+
+20. Attach a single container to two networks (a frontend and a backend) and explain the segmentation benefit.
+A
+podman network create frontend
+podman network create backend
+podman run -d --name app --network frontend docker.io/library/alpine sleep 1d
+podman network connect backend app
+The app can talk to both frontend and backend tiers, while containers only on frontend cannot directly reach backend-only services like databases.
+
+21. Use podman compose logs and podman compose ps to observe and troubleshoot a multi-service stack.
+A
+podman compose ps shows running/exited/unhealthy services. podman compose logs, podman compose logs app, and podman compose logs -f db show startup messages, errors, failed connections, and healthcheck output.
+
+22. Share configuration across two replicas of the same app via a shared named volume, and explain a risk of shared read-write storage.
+A
+podman volume create shared-config
+podman run -d --name app1 -v shared-config:/config docker.io/library/alpine sleep 1d
+podman run -d --name app2 -v shared-config:/config docker.io/library/alpine sleep 1d
+Both replicas see the same files. The risk is data corruption or overwrites if both write to the same files without coordination.
+
+23. Tear down a stack with podman compose down, then explain what happens to named volumes and how --volumes changes that.
+A
+podman compose down removes containers and default networks but normally keeps named volumes. podman compose down --volumes also removes the named volumes, so persistent data stored there is deleted.

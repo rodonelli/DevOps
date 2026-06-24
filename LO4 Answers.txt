@@ -1,0 +1,291 @@
+﻿LO4
+
+1. Create a Deployment named web running nginx:1.25 with 3 replicas using a single imperative kubectl create deployment command, then export its generated YAML to a file.
+A
+kubectl create deployment web --image=nginx:1.25 --replicas=3 --dry-run=client -o yaml > web.yaml
+kubectl apply -f web.yaml
+kubectl get deployment web
+The first command generates YAML; apply creates the Deployment.
+
+2. Enable pulling images from DockerHub as an authenticated user to lower the chance of hitting the pull limit. What kind of resource do you need to create?
+A
+Create a docker-registry image pull Secret:
+kubectl create secret docker-registry dockerhub-creds --docker-server=https://index.docker.io/v1/ --docker-username=USER --docker-password=PASS --docker-email=EMAIL
+Reference it with imagePullSecrets or attach it to the ServiceAccount.
+
+3. Scale web from 3 to 5 replicas two different ways, once with kubectl scale, once by editing the manifest, and show the ReplicaSet that results.
+A
+kubectl scale deployment web --replicas=5
+Or edit spec.replicas: 5 in web.yaml and run kubectl apply -f web.yaml.
+Show it with: kubectl get rs -l app=web. The active ReplicaSet should show 5 desired/current replicas.
+
+4. Perform a rolling update of web from nginx:1.25 to nginx:1.27 and watch it with kubectl rollout status.
+A
+kubectl set image deployment/web nginx=nginx:1.27
+kubectl rollout status deployment/web
+Kubernetes creates a new ReplicaSet and gradually replaces old pods with new ones.
+
+5. View a Deployment's rollout history and roll back to the previous revision. Explain what the CHANGE-CAUSE column shows and how to populate it.
+A
+kubectl rollout history deployment/web
+kubectl rollout undo deployment/web
+CHANGE-CAUSE records the reason/command for a revision. Populate it with:
+kubectl annotate deployment web kubernetes.io/change-cause="update nginx" --overwrite
+
+6. Set the update strategy to RollingUpdate with maxSurge: 1 and maxUnavailable: 0, and explain the effect on availability during an update.
+A
+Set strategy.rollingUpdate.maxSurge: 1 and maxUnavailable: 0. Kubernetes may create one extra pod during the update and will not intentionally make any desired replica unavailable, so availability is preserved.
+
+7. Switch a Deployment's strategy to Recreate and describe a concrete scenario where this is required instead of RollingUpdate.
+A
+Set strategy.type: Recreate. Recreate stops old pods before starting new ones. Use it when two versions cannot safely run together, such as an app doing incompatible database migrations or using exclusive shared storage.
+
+8. Add CPU/memory requests and limits to a Deployment's container and verify they appear in the running pod spec.
+A
+Add under the container:
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+Verify with kubectl get pod POD -o yaml or kubectl describe pod POD.
+
+9. Set revisionHistoryLimit: 3 and explain how it affects your ability to roll back and how many old ReplicaSets are kept.
+A
+Set spec.revisionHistoryLimit: 3. Kubernetes keeps up to three old ReplicaSets for rollback. Older revisions are cleaned up, so you cannot roll back to revisions no longer retained.
+
+10. Set a Deployment's image to a non-existent tag, observe the rollout get stuck, and explain why the old pods keep serving traffic.
+A
+kubectl set image deployment/web nginx=nginx:no-such-tag
+kubectl rollout status deployment/web
+New pods fail with ImagePullBackOff. With RollingUpdate, old ready pods are kept until replacements are ready, so traffic keeps working.
+
+11. Use a label selector to list only the pods belonging to one Deployment, and explain the Deployment -> ReplicaSet -> Pod selector relationship.
+A
+kubectl get pods -l app=web
+The Deployment selector matches ReplicaSets, and the ReplicaSet selector matches pods created from the template. Matching labels connect Deployment, ReplicaSet, and pods.
+
+12. Expose a Deployment with kubectl expose, then explain what object was created and how its selector was derived.
+A
+kubectl expose deployment web --port=80 --target-port=80
+This creates a Service. The Service selector is derived from the Deployment's pod labels, such as app=web.
+
+13. Add a sidecar (second) container to a Deployment's pod template and explain how the two containers share the pod network and volumes.
+A
+Add another item under spec.template.spec.containers. Both containers in the pod share one IP address and can communicate over localhost. They can also mount the same volumes, such as emptyDir, to exchange files.
+
+14. Write a Deployment manifest for httpd:2.4 with 2 replicas, a named container port, and a nodeSelector; explain why it stays Pending if no node matches.
+A
+Use replicas: 2, image httpd:2.4, ports: name http/containerPort 80, and nodeSelector such as disktype: ssd. If no node has that label, the scheduler cannot place the pods, so they remain Pending.
+
+15. Create a bare Pod (no controller) running busybox that sleeps, then explain what happens when you delete it versus a Deployment-managed pod.
+A
+kubectl run sleeper --image=busybox -- sleep 1d
+Deleting this pod removes it permanently. Deleting a Deployment-managed pod causes the ReplicaSet to create a replacement.
+
+16. Write a StatefulSet for redis:7 with 3 replicas plus a headless Service, and show the stable pod names and per-pod DNS records.
+A
+Create a headless Service with clusterIP: None and a StatefulSet with serviceName pointing to it. Pods are redis-0, redis-1, redis-2. DNS names are redis-0.redis.default.svc.cluster.local, redis-1.redis.default.svc.cluster.local, and redis-2.redis.default.svc.cluster.local.
+
+17. Create a DaemonSet running a busybox agent and explain why exactly one pod runs per node.
+A
+A DaemonSet schedules one pod on each eligible node. If a new node joins, it gets a pod; if a node leaves, its pod disappears. This is useful for agents, log collectors, and node monitoring.
+
+18. Create a Job using busybox/perl that computes something once and completes; show COMPLETIONS and read the result from logs.
+A
+kubectl create job pi --image=perl:5.34 -- perl -Mbignum=bpi -wle 'print bpi(20)'
+kubectl get jobs
+kubectl logs job/pi
+COMPLETIONS should become 1/1, and the result is in the logs.
+
+19. Create a CronJob that prints the date every minute; show how to suspend it and how to list the Jobs it spawns.
+A
+kubectl create cronjob print-date --image=busybox --schedule="* * * * *" -- date
+kubectl patch cronjob print-date -p '{"spec":{"suspend":true}}'
+kubectl get jobs
+The CronJob creates Jobs on schedule until suspended.
+
+20. Manually run a Job from an existing CronJob (kubectl create job --from=cronjob/...) to test it on demand.
+A
+kubectl create job print-date-now --from=cronjob/print-date
+kubectl logs job/print-date-now
+This creates a one-time Job from the CronJob template without waiting for the schedule.
+
+21. Show that a StatefulSet creates and terminates pods in order, and contrast this with a Deployment.
+A
+A StatefulSet creates pods in ordinal order, such as redis-0, then redis-1, then redis-2, and deletes highest ordinal first. A Deployment treats pods as interchangeable and does not preserve identity or strict order.
+
+22. Create a multi-container Pod where two containers share an emptyDir, one writes a file, the other reads it. Prove it is shared.
+A
+Mount the same emptyDir at /shared in both containers. Have one write echo hello > /shared/msg and the other run cat /shared/msg. If the second container prints hello, the volume is shared.
+
+23. List the StorageClasses, PVs and PVCs.
+A
+kubectl get storageclass
+kubectl get pv
+kubectl get pvc
+StorageClasses define provisioning, PVs represent storage, and PVCs request storage.
+
+24. Mount a ConfigMap as a volume so each key becomes a file, and verify the contents inside the pod.
+A
+kubectl create configmap app-config --from-literal=color=blue --from-literal=mode=dev
+Mount it as a volume at /config. Verify with kubectl exec POD -- ls /config and kubectl exec POD -- cat /config/color.
+
+25. Mount a single ConfigMap key to a specific path using subPath; explain when it is needed and its update caveat.
+A
+Use mountPath: /etc/app/app.properties and subPath: app.properties. This mounts one key as one file without replacing the whole directory. Caveat: subPath mounts do not receive live ConfigMap updates; restart the pod.
+
+26. Mount a Secret as a volume and verify the files contain decoded values with restrictive permissions.
+A
+Mount the Secret as a volume and run kubectl exec POD -- ls -l /secret and cat /secret/password. Secret files contain decoded values and restrictive file permissions, but any process allowed to read them can see the secret.
+
+27. Show that scaling a StatefulSet creates one PVC per replica, then explain what happens to those PVCs when the StatefulSet is deleted.
+A
+A StatefulSet with volumeClaimTemplates creates PVCs such as data-redis-0, data-redis-1, and data-redis-2. Deleting the StatefulSet normally leaves PVCs behind to protect data; delete PVCs separately if needed.
+
+28. Use an initContainer to pre-populate data into a shared volume before the main container reads it.
+A
+Define an emptyDir volume. The initContainer mounts it and writes files, for example echo ready > /work/status. The main container mounts the same volume and reads /work/status. Init containers complete before app containers start.
+
+29. Set readOnly: true on a volume mount and prove writes are rejected.
+A
+Set readOnly: true on the volumeMount. Then run kubectl exec POD -- sh -c "echo test > /mount/file". The command should fail with a read-only filesystem or permission error.
+
+30. Set a sizeLimit on an emptyDir and explain what happens if the container exceeds it.
+A
+Use emptyDir: { sizeLimit: 100Mi }. If the container writes too much, writes can fail or the pod can be evicted under ephemeral-storage pressure. The limit prevents unbounded emptyDir growth.
+
+31. Create a generic Secret from literals for a DB username/password, then show the stored values are base64-encoded, not encrypted.
+A
+kubectl create secret generic db-secret --from-literal=username=app --from-literal=password=secret
+kubectl get secret db-secret -o yaml
+Values under data are base64-encoded. Base64 is not encryption; use encryption at rest for stronger protection.
+
+32. Create a Secret from files (--from-file) holding a certificate and key, and identify the resulting keys.
+A
+kubectl create secret generic cert-secret --from-file=tls.crt=./tls.crt --from-file=tls.key=./tls.key
+kubectl get secret cert-secret -o yaml
+The keys are tls.crt and tls.key because those names were supplied.
+
+33. Create a kubernetes.io/tls typed Secret from a cert/key pair and explain where it is consumed.
+A
+kubectl create secret tls site-tls --cert=tls.crt --key=tls.key
+This creates type kubernetes.io/tls with tls.crt and tls.key. It is commonly consumed by Ingress controllers or web servers for HTTPS termination.
+
+34. Mount a Secret as a volume and explain the security trade-offs versus env vars.
+A
+Secret volumes expose secrets as files and can be updated by Kubernetes. Env vars are easy but can leak through process inspection, debug output, or crash dumps. Volume files still need correct permissions because any process that can read the file can read the secret.
+
+35. Use envFrom with a secretRef to load every key of a Secret as env vars at once.
+A
+envFrom:
+- secretRef:
+    name: db-secret
+This loads every key in db-secret as an environment variable. It is convenient but exposes all keys to the container.
+
+36. Create a docker-registry (image-pull) Secret and reference it via imagePullSecrets; explain when it is required.
+A
+kubectl create secret docker-registry regcred --docker-server=REGISTRY --docker-username=USER --docker-password=PASS --docker-email=EMAIL
+Reference it under imagePullSecrets. It is required for private images or authenticated pulls to avoid anonymous registry limits.
+
+37. Create a Secret with several keys and selectively mount only one of them into a pod.
+A
+Use items in the Secret volume:
+secret:
+  secretName: app-secret
+  items:
+  - key: password
+    path: password
+Only the selected key appears in the mounted directory.
+
+38. Create a ClusterIP Service for a Deployment and resolve it by DNS from another pod (nslookup <svc>.<ns>.svc.cluster.local).
+A
+kubectl expose deployment web --name web-svc --port=80 --target-port=80
+kubectl run tmp --rm -it --image=busybox -- sh
+Inside the pod run: nslookup web-svc.default.svc.cluster.local. The Service has a stable cluster DNS name.
+
+39. Create a NodePort Service and reach it via minikube service <svc> --url and $(minikube ip):<nodePort>.
+A
+kubectl expose deployment web --name web-nodeport --type=NodePort --port=80 --target-port=80
+minikube service web-nodeport --url
+kubectl get svc web-nodeport
+curl http://$(minikube ip):NODEPORT
+NodePort opens a port on each node and forwards it to the Service.
+
+40. Create a LoadBalancer Service, explain why EXTERNAL-IP is <pending> on minikube, and obtain access with minikube tunnel.
+A
+kubectl expose deployment web --name web-lb --type=LoadBalancer --port=80 --target-port=80
+On minikube, EXTERNAL-IP is pending because there is no cloud load balancer. Run minikube tunnel to provide external access locally.
+
+41. Create a headless Service (clusterIP: None) for a StatefulSet and show it returns per-pod A records instead of a single VIP.
+A
+Set clusterIP: None on the Service used by the StatefulSet. DNS returns individual pod records such as redis-0.redis.default.svc.cluster.local instead of one virtual Service IP.
+
+42. Inspect a Service's Endpoints/EndpointSlice and explain how they are populated from the pod selector.
+A
+kubectl get endpoints web-svc
+kubectl get endpointslice -l kubernetes.io/service-name=web-svc
+Kubernetes adds ready pods that match the Service selector as endpoints.
+
+43. Demonstrate cross-namespace access using the FQDN, and show the short name fails from another namespace.
+A
+From namespace test, use web-svc.default.svc.cluster.local to reach a Service in default. The short name web-svc fails because it resolves in the caller's namespace first.
+
+44. Compare kubectl port-forward to a Service versus to a Pod. Explain the difference and when each fits.
+A
+Port-forward to a pod connects to one exact pod, useful for debugging that pod. Port-forward to a Service connects through the Service to one selected backend, useful for testing Service routing without exposing it externally.
+
+45. Explain the difference between a Service's port, targetPort, and nodePort.
+A
+port is the Service port inside the cluster. targetPort is the port on the selected pod/container. nodePort is the externally reachable port opened on each node for NodePort/LoadBalancer Services.
+
+46. Verify connectivity to a ClusterIP Service from a throwaway debug pod with wget/nc.
+A
+kubectl run tmp --rm -it --image=busybox -- sh
+Inside run: wget -O- http://web-svc.default.svc.cluster.local or nc -zv web-svc 80. This tests connectivity from inside the cluster.
+
+47. Create two Deployments and one Service that load-balances across both by sharing a common label; prove requests hit both.
+A
+Give both Deployments a shared label such as tier=web. Create one Service with selector tier=web. kubectl get endpoints SERVICE should show pods from both Deployments. Repeated requests should hit both if their responses differ.
+
+48. Systematically diagnose why a pod cannot reach a Service: DNS -> endpoints -> selector labels -> readiness -> port.
+A
+Check nslookup SERVICE, kubectl get endpoints SERVICE, Service selector versus pod labels, pod readiness, and service port/targetPort. The first failed step identifies whether the issue is DNS, no backends, wrong labels, readiness, or wrong port.
+
+49. Expose a service with a NodePort and verify it works.
+A
+kubectl expose deployment web --type=NodePort --name web-np --port=80 --target-port=80
+kubectl get svc web-np
+curl http://$(minikube ip):NODEPORT
+A successful response verifies the NodePort.
+
+50. Add an HTTP livenessProbe hitting / on port 80 to an nginx Deployment and verify via kubectl describe pod.
+A
+Add:
+livenessProbe:
+  httpGet:
+    path: /
+    port: 80
+  initialDelaySeconds: 5
+  periodSeconds: 10
+Verify with kubectl describe pod POD.
+
+51. Add a tcpSocket readiness probe to a redis container on port 6379 and verify it.
+A
+Add:
+readinessProbe:
+  tcpSocket:
+    port: 6379
+  initialDelaySeconds: 5
+  periodSeconds: 10
+Verify with kubectl describe pod POD and kubectl get pods. The pod becomes Ready only when Redis accepts TCP connections.
+
+52. Configure a startup probe with a failureThreshold * periodSeconds budget for a ~2-minute boot and justify the numbers.
+A
+Use periodSeconds: 10 and failureThreshold: 12. That gives about 120 seconds before startup failure. This protects slow-starting apps from liveness checks killing them too early.
+
+53. Explain the default behavior when no probes are defined at all.
+A
+Kubernetes considers the container alive while its main process runs and usually considers the pod ready after startup. Without probes, Kubernetes cannot tell whether the application is actually healthy or ready to serve traffic.
