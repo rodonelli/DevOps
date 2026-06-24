@@ -1,0 +1,837 @@
+﻿LO3
+
+1. Create a pod with podman pod create (publishing a port), add an app container and a database container to it, and show they reach each other over localhost (shared network namespace).
+A
+Create the pod and publish the port on the pod:
+podman pod create --name lo3pod -p 8080:80
+podman run -d --pod lo3pod --name db -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --pod lo3pod --name app docker.io/library/nginx:latest
+Containers in the same pod share the network namespace, so app can reach db through localhost, for example with: podman exec app nc -zv localhost 5432.
+
+2. Create a user-defined network, run an app container and a postgres container on it, and prove the app resolves the database by container name (podman DNS on custom networks).
+A
+podman network create appnet
+podman run -d --name db --network appnet -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --name app --network appnet docker.io/library/alpine sleep 1d
+podman exec app getent hosts db
+podman exec app nc -zv db 5432
+On a custom network, Podman DNS resolves the container name db to the database container IP.
+
+3. Deploy a two-tier stack of your choice that is not Drupal/Joomla/WordPress (e.g. Ghost + MySQL, Gitea + PostgreSQL, or Redmine + PostgreSQL) and complete its first-run setup.
+A
+Example: Gitea + PostgreSQL.
+podman network create gitea-net
+podman volume create gitea-db
+podman volume create gitea-data
+podman run -d --name gitea-db --network gitea-net -v gitea-db:/var/lib/postgresql/data -e POSTGRES_DB=gitea -e POSTGRES_USER=gitea -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --name gitea --network gitea-net -p 3000:3000 -v gitea-data:/data -e GITEA__database__DB_TYPE=postgres -e GITEA__database__HOST=gitea-db:5432 -e GITEA__database__NAME=gitea -e GITEA__database__USER=gitea -e GITEA__database__PASSWD=secret docker.io/gitea/gitea:latest
+Open http://localhost:3000 and finish the first-run installer using the PostgreSQL settings.
+
+4. Persist the database's data in a named volume so it survives podman rm + re-creation of the DB container; prove the data is still there afterward.
+A
+podman volume create pgdata
+podman run -d --name pg -v pgdata:/var/lib/postgresql/data -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman exec pg psql -U postgres -c "CREATE TABLE test(id int); INSERT INTO test VALUES (1);"
+podman rm -f pg
+podman run -d --name pg -v pgdata:/var/lib/postgresql/data -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman exec pg psql -U postgres -c "SELECT * FROM test;"
+The row is still present because the volume, not the container filesystem, stored the database data.
+
+5. Use a podman secret (podman secret create + --secret) to pass the database password instead of --env; explain the security benefit.
+A
+printf "secretpass" | podman secret create db_password -
+podman run -d --name pg --secret db_password,type=env,target=POSTGRES_PASSWORD docker.io/library/postgres:16
+Secrets reduce exposure in shell history, compose files, and container inspection output compared with plain environment variables in the run command.
+
+6. Write a podman compose file (compose.yaml) for an app + database, bring it up with podman compose up -d, and show both services running.
+A
+compose.yaml:
+services:
+  db:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: appdb
+  app:
+    image: docker.io/library/adminer:latest
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+Run: podman compose up -d, then podman compose ps. Both services should be listed as running.
+
+7. In that compose file, keep the database on an internal network with no published port and expose only the app; prove the DB is not reachable from the host.
+A
+Put both services on a backend network, but publish only the app port. Do not add ports: to db.
+networks:
+  backend:
+    internal: true
+From the host, nc -zv localhost 5432 should fail because the database has no published host port. The app can still reach db by service name on the internal network.
+
+8. Add a compose healthcheck plus depends_on: condition: service_healthy so the app waits for the database; demonstrate the startup ordering.
+A
+Add to db:
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U postgres"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+Add to app:
+depends_on:
+  db:
+    condition: service_healthy
+After podman compose up -d, podman compose ps shows db becoming healthy before app starts.
+
+9. Use an env_file: in compose for the database credentials instead of inline values.
+A
+Create db.env:
+POSTGRES_DB=appdb
+POSTGRES_USER=appuser
+POSTGRES_PASSWORD=secret
+Use it:
+services:
+  db:
+    image: docker.io/library/postgres:16
+    env_file:
+      - db.env
+This separates credentials/configuration from the main compose.yaml.
+
+10. Scale one compose service to multiple replicas (podman compose up --scale app=3) and explain how requests are distributed.
+A
+podman compose up -d --scale app=3
+podman compose ps
+Compose creates three app containers. Requests are distributed only if a load balancer or reverse proxy routes to those replicas; a single host port cannot normally be bound by all replicas at once.
+
+11. Mount a bind mount for app configuration and a named volume for data in the same container, and explain why you would use each.
+A
+podman volume create appdata
+podman run -d --name app -v ./config:/etc/app:ro -v appdata:/var/lib/appdata docker.io/library/alpine sleep 1d
+Use a bind mount for host-editable configuration and a named volume for persistent app data managed by Podman.
+
+12. Back up a named volume to a tarball using a helper alpine/busybox container that mounts the volume, then restore it into a fresh volume.
+A
+Backup:
+podman run --rm -v appdata:/data:ro -v "$PWD":/backup docker.io/library/alpine tar czf /backup/appdata.tar.gz -C /data .
+Restore:
+podman volume create appdata2
+podman run --rm -v appdata2:/data -v "$PWD":/backup docker.io/library/alpine sh -c "cd /data && tar xzf /backup/appdata.tar.gz"
+The helper container can access both the volume and the backup directory.
+
+13. Put an nginx reverse-proxy container in front of an app container on a shared network and route host traffic through nginx to the app.
+A
+podman network create webnet
+podman run -d --name app --network webnet docker.io/library/httpd:2.4
+Create nginx.conf with proxy_pass http://app:80; and run:
+podman run -d --name proxy --network webnet -p 8080:80 -v ./nginx.conf:/etc/nginx/conf.d/default.conf:ro docker.io/library/nginx:latest
+Traffic to localhost:8080 goes to nginx, then nginx forwards it to app by name.
+
+14. Add a database-admin container (e.g. adminer or pgadmin) to the network and use it to inspect the database.
+A
+podman network create dbnet
+podman run -d --name db --network dbnet -e POSTGRES_PASSWORD=secret docker.io/library/postgres:16
+podman run -d --name adminer --network dbnet -p 8080:8080 docker.io/library/adminer:latest
+Open http://localhost:8080 and log in with server db, user postgres, and password secret.
+
+15. Generate Kubernetes YAML from a running pod with podman generate kube and explain how it bridges LO3 to LO4.
+A
+podman pod create --name webpod -p 8080:80
+podman run -d --pod webpod --name web docker.io/library/nginx:latest
+podman generate kube webpod > webpod.yaml
+This bridges LO3 to LO4 because a local Podman pod is converted into Kubernetes YAML that can be studied or reused with Kubernetes-style tooling.
+
+16. Run a pod from a Kubernetes YAML with podman kube play, then tear it down with podman kube play --down.
+A
+podman kube play webpod.yaml
+podman pod ps
+podman kube play --down webpod.yaml
+podman pod ps
+podman kube play starts resources from Kubernetes YAML locally; --down removes them.
+
+17. Set per-service CPU/memory limits in a compose file and verify them with podman stats.
+A
+In compose:
+deploy:
+  resources:
+    limits:
+      cpus: "0.50"
+      memory: 256M
+Run podman compose up -d and verify live usage with podman stats. podman inspect can also show configured limits.
+
+18. Inspect a pod with podman pod inspect and show which Linux namespaces the containers share (network, IPC) and which they do not (PID by default).
+A
+podman pod inspect lo3pod
+Containers in a pod share the network namespace, so they share IP/localhost. They commonly share IPC/UTS through the pod infrastructure container. PID is not shared by default, so processes are isolated unless PID sharing is enabled.
+
+19. Demonstrate name-based discovery failing when two containers are on different networks, then fix it by attaching them to a common network.
+A
+Create net1 and net2, run container a on net1 and b on net2, then podman exec a getent hosts b fails. Fix with:
+podman network connect net1 b
+podman exec a getent hosts b
+After b joins net1, a can resolve b by name.
+
+20. Attach a single container to two networks (a frontend and a backend) and explain the segmentation benefit.
+A
+podman network create frontend
+podman network create backend
+podman run -d --name app --network frontend docker.io/library/alpine sleep 1d
+podman network connect backend app
+The app can talk to both frontend and backend tiers, while containers only on frontend cannot directly reach backend-only services like databases.
+
+21. Use podman compose logs and podman compose ps to observe and troubleshoot a multi-service stack.
+A
+podman compose ps shows running/exited/unhealthy services. podman compose logs, podman compose logs app, and podman compose logs -f db show startup messages, errors, failed connections, and healthcheck output.
+
+22. Share configuration across two replicas of the same app via a shared named volume, and explain a risk of shared read-write storage.
+A
+podman volume create shared-config
+podman run -d --name app1 -v shared-config:/config docker.io/library/alpine sleep 1d
+podman run -d --name app2 -v shared-config:/config docker.io/library/alpine sleep 1d
+Both replicas see the same files. The risk is data corruption or overwrites if both write to the same files without coordination.
+
+23. Tear down a stack with podman compose down, then explain what happens to named volumes and how --volumes changes that.
+A
+podman compose down removes containers and default networks but normally keeps named volumes. podman compose down --volumes also removes the named volumes, so persistent data stored there is deleted.
+
+
+
+LO4
+
+1. Create a Deployment named web running nginx:1.25 with 3 replicas using a single imperative kubectl create deployment command, then export its generated YAML to a file.
+A
+kubectl create deployment web --image=nginx:1.25 --replicas=3 --dry-run=client -o yaml > web.yaml
+kubectl apply -f web.yaml
+kubectl get deployment web
+The first command generates YAML; apply creates the Deployment.
+
+2. Enable pulling images from DockerHub as an authenticated user to lower the chance of hitting the pull limit. What kind of resource do you need to create?
+A
+Create a docker-registry image pull Secret:
+kubectl create secret docker-registry dockerhub-creds --docker-server=https://index.docker.io/v1/ --docker-username=USER --docker-password=PASS --docker-email=EMAIL
+Reference it with imagePullSecrets or attach it to the ServiceAccount.
+
+3. Scale web from 3 to 5 replicas two different ways, once with kubectl scale, once by editing the manifest, and show the ReplicaSet that results.
+A
+kubectl scale deployment web --replicas=5
+Or edit spec.replicas: 5 in web.yaml and run kubectl apply -f web.yaml.
+Show it with: kubectl get rs -l app=web. The active ReplicaSet should show 5 desired/current replicas.
+
+4. Perform a rolling update of web from nginx:1.25 to nginx:1.27 and watch it with kubectl rollout status.
+A
+kubectl set image deployment/web nginx=nginx:1.27
+kubectl rollout status deployment/web
+Kubernetes creates a new ReplicaSet and gradually replaces old pods with new ones.
+
+5. View a Deployment's rollout history and roll back to the previous revision. Explain what the CHANGE-CAUSE column shows and how to populate it.
+A
+kubectl rollout history deployment/web
+kubectl rollout undo deployment/web
+CHANGE-CAUSE records the reason/command for a revision. Populate it with:
+kubectl annotate deployment web kubernetes.io/change-cause="update nginx" --overwrite
+
+6. Set the update strategy to RollingUpdate with maxSurge: 1 and maxUnavailable: 0, and explain the effect on availability during an update.
+A
+Set strategy.rollingUpdate.maxSurge: 1 and maxUnavailable: 0. Kubernetes may create one extra pod during the update and will not intentionally make any desired replica unavailable, so availability is preserved.
+
+7. Switch a Deployment's strategy to Recreate and describe a concrete scenario where this is required instead of RollingUpdate.
+A
+Set strategy.type: Recreate. Recreate stops old pods before starting new ones. Use it when two versions cannot safely run together, such as an app doing incompatible database migrations or using exclusive shared storage.
+
+8. Add CPU/memory requests and limits to a Deployment's container and verify they appear in the running pod spec.
+A
+Add under the container:
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+Verify with kubectl get pod POD -o yaml or kubectl describe pod POD.
+
+9. Set revisionHistoryLimit: 3 and explain how it affects your ability to roll back and how many old ReplicaSets are kept.
+A
+Set spec.revisionHistoryLimit: 3. Kubernetes keeps up to three old ReplicaSets for rollback. Older revisions are cleaned up, so you cannot roll back to revisions no longer retained.
+
+10. Set a Deployment's image to a non-existent tag, observe the rollout get stuck, and explain why the old pods keep serving traffic.
+A
+kubectl set image deployment/web nginx=nginx:no-such-tag
+kubectl rollout status deployment/web
+New pods fail with ImagePullBackOff. With RollingUpdate, old ready pods are kept until replacements are ready, so traffic keeps working.
+
+11. Use a label selector to list only the pods belonging to one Deployment, and explain the Deployment -> ReplicaSet -> Pod selector relationship.
+A
+kubectl get pods -l app=web
+The Deployment selector matches ReplicaSets, and the ReplicaSet selector matches pods created from the template. Matching labels connect Deployment, ReplicaSet, and pods.
+
+12. Expose a Deployment with kubectl expose, then explain what object was created and how its selector was derived.
+A
+kubectl expose deployment web --port=80 --target-port=80
+This creates a Service. The Service selector is derived from the Deployment's pod labels, such as app=web.
+
+13. Add a sidecar (second) container to a Deployment's pod template and explain how the two containers share the pod network and volumes.
+A
+Add another item under spec.template.spec.containers. Both containers in the pod share one IP address and can communicate over localhost. They can also mount the same volumes, such as emptyDir, to exchange files.
+
+14. Write a Deployment manifest for httpd:2.4 with 2 replicas, a named container port, and a nodeSelector; explain why it stays Pending if no node matches.
+A
+Use replicas: 2, image httpd:2.4, ports: name http/containerPort 80, and nodeSelector such as disktype: ssd. If no node has that label, the scheduler cannot place the pods, so they remain Pending.
+
+15. Create a bare Pod (no controller) running busybox that sleeps, then explain what happens when you delete it versus a Deployment-managed pod.
+A
+kubectl run sleeper --image=busybox -- sleep 1d
+Deleting this pod removes it permanently. Deleting a Deployment-managed pod causes the ReplicaSet to create a replacement.
+
+16. Write a StatefulSet for redis:7 with 3 replicas plus a headless Service, and show the stable pod names and per-pod DNS records.
+A
+Create a headless Service with clusterIP: None and a StatefulSet with serviceName pointing to it. Pods are redis-0, redis-1, redis-2. DNS names are redis-0.redis.default.svc.cluster.local, redis-1.redis.default.svc.cluster.local, and redis-2.redis.default.svc.cluster.local.
+
+17. Create a DaemonSet running a busybox agent and explain why exactly one pod runs per node.
+A
+A DaemonSet schedules one pod on each eligible node. If a new node joins, it gets a pod; if a node leaves, its pod disappears. This is useful for agents, log collectors, and node monitoring.
+
+18. Create a Job using busybox/perl that computes something once and completes; show COMPLETIONS and read the result from logs.
+A
+kubectl create job pi --image=perl:5.34 -- perl -Mbignum=bpi -wle 'print bpi(20)'
+kubectl get jobs
+kubectl logs job/pi
+COMPLETIONS should become 1/1, and the result is in the logs.
+
+19. Create a CronJob that prints the date every minute; show how to suspend it and how to list the Jobs it spawns.
+A
+kubectl create cronjob print-date --image=busybox --schedule="* * * * *" -- date
+kubectl patch cronjob print-date -p '{"spec":{"suspend":true}}'
+kubectl get jobs
+The CronJob creates Jobs on schedule until suspended.
+
+20. Manually run a Job from an existing CronJob (kubectl create job --from=cronjob/...) to test it on demand.
+A
+kubectl create job print-date-now --from=cronjob/print-date
+kubectl logs job/print-date-now
+This creates a one-time Job from the CronJob template without waiting for the schedule.
+
+21. Show that a StatefulSet creates and terminates pods in order, and contrast this with a Deployment.
+A
+A StatefulSet creates pods in ordinal order, such as redis-0, then redis-1, then redis-2, and deletes highest ordinal first. A Deployment treats pods as interchangeable and does not preserve identity or strict order.
+
+22. Create a multi-container Pod where two containers share an emptyDir, one writes a file, the other reads it. Prove it is shared.
+A
+Mount the same emptyDir at /shared in both containers. Have one write echo hello > /shared/msg and the other run cat /shared/msg. If the second container prints hello, the volume is shared.
+
+23. List the StorageClasses, PVs and PVCs.
+A
+kubectl get storageclass
+kubectl get pv
+kubectl get pvc
+StorageClasses define provisioning, PVs represent storage, and PVCs request storage.
+
+24. Mount a ConfigMap as a volume so each key becomes a file, and verify the contents inside the pod.
+A
+kubectl create configmap app-config --from-literal=color=blue --from-literal=mode=dev
+Mount it as a volume at /config. Verify with kubectl exec POD -- ls /config and kubectl exec POD -- cat /config/color.
+
+25. Mount a single ConfigMap key to a specific path using subPath; explain when it is needed and its update caveat.
+A
+Use mountPath: /etc/app/app.properties and subPath: app.properties. This mounts one key as one file without replacing the whole directory. Caveat: subPath mounts do not receive live ConfigMap updates; restart the pod.
+
+26. Mount a Secret as a volume and verify the files contain decoded values with restrictive permissions.
+A
+Mount the Secret as a volume and run kubectl exec POD -- ls -l /secret and cat /secret/password. Secret files contain decoded values and restrictive file permissions, but any process allowed to read them can see the secret.
+
+27. Show that scaling a StatefulSet creates one PVC per replica, then explain what happens to those PVCs when the StatefulSet is deleted.
+A
+A StatefulSet with volumeClaimTemplates creates PVCs such as data-redis-0, data-redis-1, and data-redis-2. Deleting the StatefulSet normally leaves PVCs behind to protect data; delete PVCs separately if needed.
+
+28. Use an initContainer to pre-populate data into a shared volume before the main container reads it.
+A
+Define an emptyDir volume. The initContainer mounts it and writes files, for example echo ready > /work/status. The main container mounts the same volume and reads /work/status. Init containers complete before app containers start.
+
+29. Set readOnly: true on a volume mount and prove writes are rejected.
+A
+Set readOnly: true on the volumeMount. Then run kubectl exec POD -- sh -c "echo test > /mount/file". The command should fail with a read-only filesystem or permission error.
+
+30. Set a sizeLimit on an emptyDir and explain what happens if the container exceeds it.
+A
+Use emptyDir: { sizeLimit: 100Mi }. If the container writes too much, writes can fail or the pod can be evicted under ephemeral-storage pressure. The limit prevents unbounded emptyDir growth.
+
+31. Create a generic Secret from literals for a DB username/password, then show the stored values are base64-encoded, not encrypted.
+A
+kubectl create secret generic db-secret --from-literal=username=app --from-literal=password=secret
+kubectl get secret db-secret -o yaml
+Values under data are base64-encoded. Base64 is not encryption; use encryption at rest for stronger protection.
+
+32. Create a Secret from files (--from-file) holding a certificate and key, and identify the resulting keys.
+A
+kubectl create secret generic cert-secret --from-file=tls.crt=./tls.crt --from-file=tls.key=./tls.key
+kubectl get secret cert-secret -o yaml
+The keys are tls.crt and tls.key because those names were supplied.
+
+33. Create a kubernetes.io/tls typed Secret from a cert/key pair and explain where it is consumed.
+A
+kubectl create secret tls site-tls --cert=tls.crt --key=tls.key
+This creates type kubernetes.io/tls with tls.crt and tls.key. It is commonly consumed by Ingress controllers or web servers for HTTPS termination.
+
+34. Mount a Secret as a volume and explain the security trade-offs versus env vars.
+A
+Secret volumes expose secrets as files and can be updated by Kubernetes. Env vars are easy but can leak through process inspection, debug output, or crash dumps. Volume files still need correct permissions because any process that can read the file can read the secret.
+
+35. Use envFrom with a secretRef to load every key of a Secret as env vars at once.
+A
+envFrom:
+- secretRef:
+    name: db-secret
+This loads every key in db-secret as an environment variable. It is convenient but exposes all keys to the container.
+
+36. Create a docker-registry (image-pull) Secret and reference it via imagePullSecrets; explain when it is required.
+A
+kubectl create secret docker-registry regcred --docker-server=REGISTRY --docker-username=USER --docker-password=PASS --docker-email=EMAIL
+Reference it under imagePullSecrets. It is required for private images or authenticated pulls to avoid anonymous registry limits.
+
+37. Create a Secret with several keys and selectively mount only one of them into a pod.
+A
+Use items in the Secret volume:
+secret:
+  secretName: app-secret
+  items:
+  - key: password
+    path: password
+Only the selected key appears in the mounted directory.
+
+38. Create a ClusterIP Service for a Deployment and resolve it by DNS from another pod (nslookup <svc>.<ns>.svc.cluster.local).
+A
+kubectl expose deployment web --name web-svc --port=80 --target-port=80
+kubectl run tmp --rm -it --image=busybox -- sh
+Inside the pod run: nslookup web-svc.default.svc.cluster.local. The Service has a stable cluster DNS name.
+
+39. Create a NodePort Service and reach it via minikube service <svc> --url and $(minikube ip):<nodePort>.
+A
+kubectl expose deployment web --name web-nodeport --type=NodePort --port=80 --target-port=80
+minikube service web-nodeport --url
+kubectl get svc web-nodeport
+curl http://$(minikube ip):NODEPORT
+NodePort opens a port on each node and forwards it to the Service.
+
+40. Create a LoadBalancer Service, explain why EXTERNAL-IP is <pending> on minikube, and obtain access with minikube tunnel.
+A
+kubectl expose deployment web --name web-lb --type=LoadBalancer --port=80 --target-port=80
+On minikube, EXTERNAL-IP is pending because there is no cloud load balancer. Run minikube tunnel to provide external access locally.
+
+41. Create a headless Service (clusterIP: None) for a StatefulSet and show it returns per-pod A records instead of a single VIP.
+A
+Set clusterIP: None on the Service used by the StatefulSet. DNS returns individual pod records such as redis-0.redis.default.svc.cluster.local instead of one virtual Service IP.
+
+42. Inspect a Service's Endpoints/EndpointSlice and explain how they are populated from the pod selector.
+A
+kubectl get endpoints web-svc
+kubectl get endpointslice -l kubernetes.io/service-name=web-svc
+Kubernetes adds ready pods that match the Service selector as endpoints.
+
+43. Demonstrate cross-namespace access using the FQDN, and show the short name fails from another namespace.
+A
+From namespace test, use web-svc.default.svc.cluster.local to reach a Service in default. The short name web-svc fails because it resolves in the caller's namespace first.
+
+44. Compare kubectl port-forward to a Service versus to a Pod. Explain the difference and when each fits.
+A
+Port-forward to a pod connects to one exact pod, useful for debugging that pod. Port-forward to a Service connects through the Service to one selected backend, useful for testing Service routing without exposing it externally.
+
+45. Explain the difference between a Service's port, targetPort, and nodePort.
+A
+port is the Service port inside the cluster. targetPort is the port on the selected pod/container. nodePort is the externally reachable port opened on each node for NodePort/LoadBalancer Services.
+
+46. Verify connectivity to a ClusterIP Service from a throwaway debug pod with wget/nc.
+A
+kubectl run tmp --rm -it --image=busybox -- sh
+Inside run: wget -O- http://web-svc.default.svc.cluster.local or nc -zv web-svc 80. This tests connectivity from inside the cluster.
+
+47. Create two Deployments and one Service that load-balances across both by sharing a common label; prove requests hit both.
+A
+Give both Deployments a shared label such as tier=web. Create one Service with selector tier=web. kubectl get endpoints SERVICE should show pods from both Deployments. Repeated requests should hit both if their responses differ.
+
+48. Systematically diagnose why a pod cannot reach a Service: DNS -> endpoints -> selector labels -> readiness -> port.
+A
+Check nslookup SERVICE, kubectl get endpoints SERVICE, Service selector versus pod labels, pod readiness, and service port/targetPort. The first failed step identifies whether the issue is DNS, no backends, wrong labels, readiness, or wrong port.
+
+49. Expose a service with a NodePort and verify it works.
+A
+kubectl expose deployment web --type=NodePort --name web-np --port=80 --target-port=80
+kubectl get svc web-np
+curl http://$(minikube ip):NODEPORT
+A successful response verifies the NodePort.
+
+50. Add an HTTP livenessProbe hitting / on port 80 to an nginx Deployment and verify via kubectl describe pod.
+A
+Add:
+livenessProbe:
+  httpGet:
+    path: /
+    port: 80
+  initialDelaySeconds: 5
+  periodSeconds: 10
+Verify with kubectl describe pod POD.
+
+51. Add a tcpSocket readiness probe to a redis container on port 6379 and verify it.
+A
+Add:
+readinessProbe:
+  tcpSocket:
+    port: 6379
+  initialDelaySeconds: 5
+  periodSeconds: 10
+Verify with kubectl describe pod POD and kubectl get pods. The pod becomes Ready only when Redis accepts TCP connections.
+
+52. Configure a startup probe with a failureThreshold * periodSeconds budget for a ~2-minute boot and justify the numbers.
+A
+Use periodSeconds: 10 and failureThreshold: 12. That gives about 120 seconds before startup failure. This protects slow-starting apps from liveness checks killing them too early.
+
+53. Explain the default behavior when no probes are defined at all.
+A
+Kubernetes considers the container alive while its main process runs and usually considers the pod ready after startup. Without probes, Kubernetes cannot tell whether the application is actually healthy or ready to serve traffic.
+
+
+
+LO5
+
+1. podman run -d --name web -p 80:8080 docker.io/library/nginx (nginx listens on 80; the site is not reachable on the host port you expected - what is reversed?)
+A
+The port order is hostPort:containerPort. The command maps host 80 to container 8080, but nginx listens on container 80. Fix:
+podman run -d --name web -p 8080:80 docker.io/library/nginx
+
+2. podman run -d --name db -e MYSQL_ROOT_PASSWORD docker.io/library/mysql (the container exits during init - inspect podman logs.)
+A
+MYSQL_ROOT_PASSWORD has no value. MySQL requires a password or another explicit init option. Fix:
+podman run -d --name db -e MYSQL_ROOT_PASSWORD=secret docker.io/library/mysql
+
+3. podman run -d --name app --network host -p 8080:80 docker.io/library/nginx (why is the -p flag effectively ignored here?)
+A
+With --network host, the container uses the host network directly, so port publishing is ignored. Fix by removing host networking:
+podman run -d --name app -p 8080:80 docker.io/library/nginx
+or keep host networking and use the port the process listens on.
+
+4. podman run -d --name c1 docker.io/library/busybox (the container goes straight to Exited (0) - why, and how do you keep it running?)
+A
+BusyBox has no long-running default process here, so it exits successfully. Fix:
+podman run -d --name c1 docker.io/library/busybox sleep 1d
+A container stays alive only while its main process runs.
+
+5. podman run --rm -d --name job docker.io/library/alpine echo hello (then podman logs job fails - explain the --rm + detached gotcha.)
+A
+The job exits quickly and --rm removes the container immediately, so logs cannot find it. Fix by omitting --rm when you need logs:
+podman run -d --name job docker.io/library/alpine echo hello
+podman logs job
+
+6. podman run -d -p 8080:80 --memory 8m docker.io/library/mysql (the database never becomes healthy - what limit is the problem?)
+A
+The memory limit is far too low. MySQL needs much more than 8 MB. Fix:
+podman run -d --name mysql -p 3306:3306 --memory 512m -e MYSQL_ROOT_PASSWORD=secret docker.io/library/mysql
+
+7. podman run -d --name a docker.io/library/alpine sleep 1d / podman run -d --name b docker.io/library/alpine sleep 1d / podman exec a ping b (name resolution fails - why, on the default network, and how do you fix it?)
+A
+Name-based DNS works on user-defined networks, not reliably on the default network. Fix:
+podman network create appnet
+podman run -d --name a --network appnet docker.io/library/alpine sleep 1d
+podman run -d --name b --network appnet docker.io/library/alpine sleep 1d
+podman exec a ping b
+
+8. podman run -d --name web -v ./html:/usr/share/nginx/html docker.io/library/nginx (the files are not visible in the container, or SELinux denies access - what mount flag is missing?)
+A
+Add an SELinux relabel flag:
+podman run -d --name web -v ./html:/usr/share/nginx/html:Z docker.io/library/nginx
+Use :z instead of :Z if multiple containers need to share the same content.
+
+9. For each Containerfile/Dockerfile: identify the mistake, fix it, and explain what was wrong.
+A
+This instruction applies to questions 10-18: identify the faulty Dockerfile/Containerfile line or design, show the corrected version, and explain the cause.
+
+10. FROM debian:12 / RUN apt-get install -y nginx (the build fails to find the package - what is missing before install?)
+A
+apt-get update is missing. Fix:
+FROM debian:12
+RUN apt-get update && apt-get install -y nginx && rm -rf /var/lib/apt/lists/*
+Package indexes must be updated before apt can install packages.
+
+11. FROM python:3.11 / COPY app.py /app/app.py / WORKDIR /app / CMD python app.py (the app starts but does not handle signals / cannot be stopped cleanly - shell vs exec form?)
+A
+CMD uses shell form. Fix with exec form:
+CMD ["python", "app.py"]
+Exec form lets Python receive signals directly as PID 1.
+
+12. FROM node:20 / COPY . /app / WORKDIR /app / RUN npm install (every source change triggers a full npm install - reorder for layer caching.)
+A
+Copy dependency metadata first:
+FROM node:20
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+Now source-only changes do not invalidate the npm install layer.
+
+13. FROM alpine:3.20 / ENV PATH=/app/bin / RUN apk add --no-cache curl (after this, curl/sh are not found - what did setting PATH break?)
+A
+PATH was overwritten and removed system paths. Fix:
+ENV PATH="/app/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+The original PATH hid commands like sh and curl.
+
+14. FROM ubuntu:24.04 / EXPOSE 8080 / CMD ["python3", "-m", "http.server", "3000"]
+A
+The app listens on 3000 but EXPOSE says 8080. Fix:
+EXPOSE 3000
+CMD ["python3", "-m", "http.server", "3000"]
+EXPOSE is metadata only; it does not change the app port.
+
+15. You map -p 8080:8080 but nothing answers - what mismatch is there, and what does EXPOSE actually do?
+A
+The container is listening on 3000, not 8080. Fix the mapping:
+podman run -p 8080:3000 IMAGE
+EXPOSE documents intended ports but does not publish ports or make the app listen there.
+
+16. FROM debian:12 / RUN apt-get update && apt-get install -y build-essential (the image is huge - how do you cut the size in the same layer?)
+A
+Clean package lists in the same layer:
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+Cleanup must be in the same RUN layer or earlier layer size remains.
+
+17. FROM python:3.11 / USER appuser / COPY requirements.txt /app/requirements.txt / RUN pip install -r /app/requirements.txt (permission denied errors - what is wrong with the USER/COPY ordering and ownership?)
+A
+The build switches to appuser before preparing ownership/permissions. Fix by creating/chowning the app directory and copying with ownership before USER, or install dependencies before switching:
+RUN useradd -m appuser && mkdir /app && chown appuser:appuser /app
+COPY --chown=appuser:appuser requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt
+USER appuser
+
+18. FROM golang:1.22 / COPY . /src / WORKDIR /src / RUN go build -o app . / CMD ["/src/app"] (the final image is about 1 GB - how would a multi-stage build fix it?)
+A
+Build in a Go image and copy only the binary into a tiny runtime image:
+FROM golang:1.22 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -o /app .
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /app /app
+CMD ["/app"]
+
+19. A pod is stuck Pending. Walk through the diagnosis with kubectl describe pod and identify the reason from the events (scheduling / resources / PVC / nodeSelector).
+A
+Run kubectl describe pod POD and read Events. Common causes: insufficient CPU/memory, unbound PVC, nodeSelector/affinity mismatch, taints without tolerations, or no ready nodes. Fix the exact event cause.
+
+20. Find a deployment from older tasks, remove a couple of spaces and try to deploy it. Identify the cause in the error messages and fix it.
+A
+YAML is indentation-sensitive. kubectl may report mapping values are not allowed, unknown field, or did not find expected key. Restore correct indentation and validate with:
+kubectl apply --dry-run=server -f deployment.yaml
+
+21. A pod is in ImagePullBackOff. Diagnose the cause (image typo, missing tag, private registry without pull secret) and fix it.
+A
+Use kubectl describe pod POD and check Events. Fix the image name/tag, push the missing image, or create/reference imagePullSecrets for a private registry.
+
+22. A pod is in CrashLoopBackOff. Use kubectl logs --previous to read the last crash and fix the root cause.
+A
+kubectl logs POD --previous
+kubectl describe pod POD
+Fix the root cause shown in logs: bad command, missing config, failed dependency, permission error, or application crash.
+
+23. A pod's last state shows OOMKilled. Confirm it from kubectl get pod -o yaml / describe, then fix it (raise the memory limit or fix the app).
+A
+Confirm with kubectl describe pod POD or kubectl get pod POD -o yaml. Look for lastState.terminated.reason: OOMKilled or exit code 137. Fix by increasing memory limits/requests or reducing app memory use.
+
+24. A Deployment's pods never become Ready. Trace it to a failing readiness probe and correct the probe or the app.
+A
+Run kubectl describe pod POD and check probe failures in Events. Fix the readiness path, port, scheme, timing, or the app health endpoint so it returns success only when ready.
+
+25. A Service returns nothing. Diagnose a Service/pod label mismatch using kubectl get endpoints.
+A
+kubectl get endpoints SERVICE
+kubectl get svc SERVICE -o yaml
+kubectl get pods --show-labels
+If endpoints are empty, the Service selector does not match ready pod labels. Fix the selector or labels.
+
+26. Given a manifest where spec.selector.matchLabels does not match spec.template.metadata.labels, explain the error kubectl apply returns and fix it.
+A
+kubectl rejects the Deployment because the selector must match template labels. Fix by making spec.selector.matchLabels and spec.template.metadata.labels use the same key/value labels.
+
+27. Given a manifest whose resources.requests exceed any node's capacity, explain why the pod is Pending (Insufficient cpu/memory) and fix it.
+A
+The scheduler cannot place a pod whose requested CPU or memory is larger than available node capacity. Events show Insufficient cpu/memory. Fix by lowering requests, adding capacity, or using a larger node.
+
+28. Given a pod mounting a PVC that does not exist, diagnose the FailedMount/Pending and create the PVC.
+A
+kubectl describe pod POD shows the missing claim. Create a PVC with the exact claimName referenced by the pod, or correct the pod manifest to reference an existing PVC.
+
+29. A container based on ubuntu with no long-running command shows Completed/CrashLoopBackOff. Explain why and add a proper command.
+A
+Ubuntu has no default long-running service. If the command exits, the container stops. Add a real foreground app command, or for testing:
+command: ["sleep", "infinity"]
+
+30. Use kubectl get events --sort-by=.lastTimestamp (or kubectl events) to triage everything that happened to a pod over time.
+A
+kubectl get events --sort-by=.lastTimestamp
+or kubectl events. Read the timeline for scheduling, image pulls, mounts, starts, probe failures, restarts, and the first real error.
+
+31. Use kubectl exec -it to get a shell in a pod and debug DNS with nslookup and cat /etc/resolv.conf.
+A
+kubectl exec -it POD -- sh
+cat /etc/resolv.conf
+nslookup kubernetes.default.svc.cluster.local
+nslookup SERVICE.NAMESPACE.svc.cluster.local
+This checks DNS servers, search domains, and service name resolution.
+
+32. Use an ephemeral debug container (kubectl debug -it <pod> --image=busybox --target=<container>) to troubleshoot a no-shell/distroless container.
+A
+kubectl debug -it POD --image=busybox --target=CONTAINER -- sh
+This adds a temporary troubleshooting container to the pod, useful when the main container has no shell or tools.
+
+33. Spin up a throwaway kubectl run tmp --rm -it --image=busybox pod to test connectivity to a Service from inside the cluster.
+A
+kubectl run tmp --rm -it --image=busybox -- sh
+Inside run nslookup SERVICE, wget -O- http://SERVICE:PORT, or nc -zv SERVICE PORT. This tests from the cluster network.
+
+34. A node shows NotReady. List what you would check (kubelet, disk pressure, CNI) and inspect it on minikube with kubectl describe node and sudo minikube logs.
+A
+Check kubectl describe node NODE for Ready condition, DiskPressure, MemoryPressure, PIDPressure, NetworkUnavailable, and events. On minikube, check minikube logs and kubelet logs. Also inspect disk space and CNI/network plugin health.
+
+35. A pod is stuck Terminating. Explain finalizers and the grace period, then force-delete it (--grace-period=0 --force) and state the risks.
+A
+Terminating can wait for graceful shutdown, finalizers, volume detach, or node response. Force delete:
+kubectl delete pod POD --grace-period=0 --force
+Risk: cleanup hooks may not finish, the process may still run on an unreachable node, and storage/network cleanup may be inconsistent.
+
+36. Given a manifest with the wrong apiVersion/kind pairing (e.g. apps/v1 + Pod), explain the validation error and correct the group/version.
+A
+Pod uses apiVersion v1, not apps/v1. apps/v1 is for Deployment, StatefulSet, and DaemonSet. Fix:
+apiVersion: v1
+kind: Pod
+kubectl reports no match or invalid kind for the apiVersion/kind pair.
+
+37. A pod fails with CreateContainerConfigError because a configMapKeyRef key is missing. Diagnose and fix.
+A
+kubectl describe pod POD shows the missing key. Add the key to the ConfigMap, correct the key name in the pod spec, or mark it optional if acceptable.
+
+38. A pod cannot mount a Secret that lives in a different namespace. Explain namespace scoping and fix it.
+A
+Secrets are namespace-scoped. A pod can only mount Secrets from its own namespace. Fix by creating/copying the Secret into the pod namespace or moving the pod to the Secret's namespace.
+
+39. A rollout is stuck with ProgressDeadlineExceeded. Use kubectl describe deployment / rollout status to find the cause and remediate.
+A
+kubectl rollout status deployment/APP
+kubectl describe deployment APP
+Then inspect the failing pods. Common causes: ImagePullBackOff, CrashLoopBackOff, readiness probe failures, or insufficient resources. Fix the pod issue and retry the rollout.
+
+40. Catch indentation/field typos (e.g. imagePullpolicy, misnested ports) before applying with kubectl apply --dry-run=server / --validate=true, then fix them.
+A
+kubectl apply --dry-run=server --validate=true -f manifest.yaml
+This catches invalid fields, wrong capitalization such as imagePullPolicy, and misnested YAML before changing the cluster.
+
+41. An app's logs say it cannot reach its database Service. Verify in order: pod running -> Service exists -> endpoints populated -> DNS resolves -> correct port, and identify the broken link.
+A
+Check:
+kubectl get pod APP_POD
+kubectl get svc DB_SERVICE
+kubectl get endpoints DB_SERVICE
+kubectl exec APP_POD -- nslookup DB_SERVICE
+kubectl exec APP_POD -- nc -zv DB_SERVICE PORT
+The first failed step shows the broken link.
+
+42. Read a container's state/lastState and restartCount with kubectl get pod -o jsonpath to determine the root cause of repeated restarts.
+A
+kubectl get pod POD -o jsonpath='{.status.containerStatuses[*].restartCount}'
+kubectl get pod POD -o jsonpath='{.status.containerStatuses[*].state}'
+kubectl get pod POD -o jsonpath='{.status.containerStatuses[*].lastState}'
+These fields show current state, previous termination reason, and how often it restarted.
+
+43. Compare OpenShift Route to Ingress.
+A
+Both expose HTTP/HTTPS apps outside the cluster. Ingress is the standard Kubernetes API and needs an Ingress controller. OpenShift Route is OpenShift's built-in routing object integrated with the OpenShift router and TLS features. Route is simpler on OpenShift; Ingress is more portable across Kubernetes distributions.
+
+
+
+
+LO6
+
+1. Analyze the networking model of Kubernetes versus Docker's network.
+A
+Docker commonly uses bridge networks where containers get private IPs and host ports are published with -p. Kubernetes gives every pod a cluster-routable IP, containers inside a pod share localhost, and Services provide stable discovery/load balancing for changing pods. Kubernetes networking is better for distributed systems because it is built around cross-node communication, service discovery, and policy.
+
+2. Evaluate Kubernetes storage abstraction (CSI, StorageClasses, dynamic provisioning) against Podman's storage plugins. Which is more flexible for stateful workloads, and why?
+A
+Kubernetes is more flexible for stateful workloads. CSI, StorageClasses, PVs, and PVCs let applications request storage without knowing the backend, and storage can be dynamically provisioned from cloud disks, SAN/NAS, or other CSI providers. Podman volumes work well on one host, but they do not provide the same cluster scheduling, dynamic provisioning, or standardized attach/detach behavior.
+
+3. Evaluate the operator pattern (CRDs + controllers) for managing stateful services versus using only k8s manifests, in terms of control and effort.
+A
+Operators encode operational knowledge into controllers. For databases, they can automate backups, upgrades, failover, scaling, and recovery. Plain manifests are simpler and give direct control, but humans must handle day-2 operations. Operators require more trust and learning, but reduce effort for complex stateful services.
+
+4. Assess the developer experience of plain Kubernetes (kubectl + manifests) versus OpenShift's Source-to-Image (S2I) and developer console. What does each optimize for?
+A
+Plain Kubernetes optimizes for portability, explicit control, and standard APIs. Developers must understand images, YAML, Services, Deployments, probes, and kubectl. OpenShift S2I and the developer console optimize for guided workflows and faster onboarding, turning source code into running apps with less manual image-building and YAML writing.
+
+5. Critically evaluate migrating a workload from OpenShift to Kubernetes.
+A
+Standard resources such as Deployments, Services, ConfigMaps, and Secrets migrate fairly well. OpenShift-specific features such as Routes, BuildConfigs, ImageStreams, SCCs, templates, and S2I need replacements. Migration can improve portability, but it may lose integrated security, build, registry, and developer tooling.
+
+6. Evaluate running CI/CD build agents (Jenkins agents, GitLab runners, Tekton) inside Kubernetes versus on dedicated VMs, considering isolation, autoscaling, and noisy-neighbor effects.
+A
+Kubernetes agents are elastic, per-job, easy to clean up, and can scale with demand. They fit tools like Tekton and dynamic GitLab/Jenkins runners. The risk is noisy-neighbor impact from heavy builds on shared nodes. Dedicated VMs are simpler and isolate heavy workloads better, but they are less elastic and can waste capacity.
+
+7. How does Kubernetes integrate with cloud environments and dynamic capacity provisioning?
+A
+Kubernetes integrates with cloud APIs for load balancers, storage, identity, networking, and autoscaling. A LoadBalancer Service can create a cloud load balancer, a PVC can create a disk through CSI, and cluster autoscaler can add nodes when pods cannot be scheduled. This lets infrastructure follow application demand.
+
+8. Critically evaluate the default security and hardening of OpenShift versus vanilla Kubernetes. Why do enterprises in regulated industries often choose OpenShift?
+A
+OpenShift has stronger default security opinions: restricted security contexts, integrated authentication, RBAC, registry controls, monitoring, logging integrations, and supported upgrades. Vanilla Kubernetes can be hardened, but it requires assembling more pieces manually. Regulated enterprises often choose OpenShift for vendor support, auditability, and safer defaults.
+
+9. Critically evaluate the learning curve and required skill set of OpenShift versus plain Kubernetes. Does OpenShift's added abstraction help or hinder a team new to containers?
+A
+OpenShift helps beginners with a console, S2I, routes, templates, and integrated workflows. It can also hinder because teams must learn Kubernetes plus OpenShift-specific concepts. It helps most when the team wants a guided enterprise platform; it hinders if the goal is to learn portable Kubernetes with minimal abstraction.
+
+10. Compare the resource footprint of full Kubernetes versus k3s for a small on-premise deployment. When is full Kubernetes overkill?
+A
+Full Kubernetes has more components and usually needs more CPU, memory, and operational care. k3s is lighter and designed for small clusters, labs, edge, and constrained environments. Full Kubernetes is overkill when workloads are small, HA needs are modest, and the team does not need advanced enterprise integrations.
+
+11. Defend whether a small team should use Docker Compose on a single host or move straight to Kubernetes, considering complexity, scaling needs, and resilience.
+A
+A small team should usually start with Docker Compose if one host is enough. It is cheaper, simpler, and faster to operate. Kubernetes is justified when they need multi-node resilience, autoscaling, rolling updates, stronger service discovery, or platform standardization. Moving too early can add more operational burden than value.
+
+12. Analyze vendor lock-in across Kubernetes (open source / CNCF) and OpenShift (Red Hat). How does the choice affect long-term flexibility?
+A
+Kubernetes has lower lock-in because it is an open CNCF standard with many providers. Managed Kubernetes still has provider-specific integrations. OpenShift is Kubernetes-based but adds Red Hat-specific APIs and workflows. It reduces operational risk through support but increases platform lock-in. Portability is highest when workloads use standard Kubernetes APIs.
+
+13. Defend a recommendation of OpenShift over vanilla Kubernetes for a company that wants an integrated, vendor-supported platform with built-in developer and operations tooling.
+A
+OpenShift is a strong recommendation because it packages Kubernetes with registry, routes, builds/S2I, developer console, monitoring, authentication integration, policy, and Red Hat support. Vanilla Kubernetes requires choosing and maintaining many separate tools. If the company values support and consistency, OpenShift fits well.
+
+14. Compare storage provisioning between Kubernetes and regular VM workloads.
+A
+With VMs, storage is often manually attached, formatted, mounted, and tracked per server. Kubernetes uses PVCs and StorageClasses so applications request storage declaratively and the platform can provision it dynamically. Kubernetes is more automated, but requires understanding reclaim policies, access modes, CSI drivers, and scheduling constraints.
+
+15. A startup with two engineers must ship a containerized product quickly and cheaply. Recommend container solution and justify your choice on cost and operational overhead.
+A
+Use Docker Compose or Podman Compose on a single VM, ideally with managed database services. It is cheap, fast, and understandable for two engineers. Kubernetes should wait until they need multi-node scaling, self-healing, or a platform team, because cluster operations would consume too much time early on.
+
+16. Compare Docker and Podman in terms of architecture (daemon vs daemonless) and rootless security. Why might a security-conscious team prefer Podman?
+A
+Docker traditionally uses a central daemon. Podman is daemonless and has strong rootless support, so users can run containers without broad access to a privileged daemon. A security-conscious team may prefer Podman because it reduces the impact of compromised container tooling or user accounts.
+
+17. Compare the day-2 operational overhead (cluster upgrades, scaling nodes, backups) of self-managed Kubernetes versus a managed Kubernetes service.
+A
+Self-managed Kubernetes gives more control but requires upgrades, etcd backups, node lifecycle, security patching, CNI troubleshooting, monitoring, and disaster recovery. Managed Kubernetes offloads much of the control-plane work and simplifies scaling/upgrades, at the cost of provider dependency and less direct control.
+
+18. A media-streaming company expects spiky, unpredictable global traffic. Recommend a containerized solution. Elaborate your choice.
+A
+Use managed Kubernetes across cloud regions with autoscaling, cloud load balancers, and a CDN. Kubernetes handles rolling updates, self-healing, service discovery, and horizontal scaling. The CDN absorbs global traffic near users. A single Compose/Podman host would not provide enough resilience or scaling for unpredictable global traffic.
+
+19. Defend whether a company that has outgrown Docker Swarm (or a single Compose host) should migrate to Kubernetes - weigh the migration effort against the long-term benefits.
+A
+If the company needs multi-node scheduling, self-healing, autoscaling, advanced deployments, and a larger ecosystem, Kubernetes is worth the migration. The effort includes rewriting deployment definitions, learning cluster operations, redesigning networking/storage, and adding observability. The long-term benefit is a standard orchestration platform that can scale with the company.
+
+20. Would you choose Kubernetes as a solution for a microservices architecture, focus on its orchestration, resilience and ecosystem. Elaborate your standing with arguments.
+A
+Yes, for serious microservices I would choose Kubernetes. It provides service discovery, rolling updates, self-healing, scaling, config/secret management, probes, and a large ecosystem. It is especially useful when services deploy independently. The trade-off is complexity, so a managed service or platform team is important.
+
+21. Would you choose Kubernetes for enterprise-grade applications, focus on its scalability, community support and feature richness. Elaborate your standing with arguments.
+A
+Yes. Kubernetes is strong for enterprise applications because it scales well, has broad community support, and has mature features for deployment, networking, storage, observability, and security integration. Enterprises must still invest in governance, monitoring, policy, and operational skill.
+
+22. Would you choose OpenShift as a solution for a microservices architecture, focus on its orchestration, resilience and ecosystem. Elaborate your standing with arguments.
+A
+Yes, especially when the organization wants Kubernetes plus an integrated enterprise platform. OpenShift supports orchestration, routes, service discovery, health checks, scaling, and strong security defaults. It is heavier and more Red Hat-specific than plain Kubernetes, but it gives a cohesive platform.
+
+23. Would you choose OpenShift for enterprise-grade applications, focus on its scalability, community support and feature richness. Elaborate your standing with arguments.
+A
+Yes. OpenShift is well suited for enterprise-grade applications because it builds on Kubernetes and adds security defaults, developer tooling, operations tooling, Red Hat support, and consistent platform features. I would choose it when compliance, support, standardization, and built-in tooling matter more than having the lightest possible platform.
